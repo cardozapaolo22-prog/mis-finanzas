@@ -1,4 +1,4 @@
-/* Mis Finanzas v2 — estilo Glass: fondo con degradado del color elegido, tarjetas de vidrio translúcido,
+/* Sol v2 — estilo Glass: fondo con degradado del color elegido, tarjetas de vidrio translúcido,
    saludo arriba, cifra principal grande, navegación inferior en el celular. */
 :root{
   /* Color elegido por la persona (lo cambia app.js) */
@@ -361,15 +361,15 @@ details.more>div{display:grid;gap:10px;padding-bottom:12px}
 
 /* ===================== v4: tarjetas de cuentas y fin de mes ===================== */
 .cards-strip{display:flex;gap:12px;overflow-x:auto;scroll-snap-type:x mandatory;padding:4px 2px 12px;margin:0 -2px;scrollbar-width:thin;-webkit-overflow-scrolling:touch}
-.acard{flex:0 0 auto;width:min(270px,78vw);aspect-ratio:1.6/1;border-radius:22px;border:1px solid hsl(0 0% 100% / .25);color:#fff;text-align:left;padding:16px 18px;display:grid;grid-template-rows:auto auto 1fr auto auto;gap:2px;position:relative;overflow:hidden;scroll-snap-align:start;box-shadow:0 14px 30px hsl(var(--h) 60% 15% / .35);isolation:isolate}
+.acard{flex:0 0 auto;width:min(270px,78vw);min-height:168px;border-radius:22px;border:1px solid hsl(0 0% 100% / .25);color:#fff;text-align:left;padding:16px 18px;display:flex;flex-direction:column;gap:2px;position:relative;overflow:hidden;scroll-snap-align:start;box-shadow:0 14px 30px hsl(var(--h) 60% 15% / .35);isolation:isolate}
 .acard::before{content:"";position:absolute;inset:0;background:linear-gradient(160deg,hsl(0 0% 100% / .28),hsl(0 0% 100% / 0) 45%);z-index:-1}
 .acard::after{content:"";position:absolute;width:190px;height:190px;right:-70px;top:-80px;border-radius:50%;background:hsl(0 0% 100% / .14);z-index:-1}
 .acard .ac-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .acard .ac-type{font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600;opacity:.9}
 .acard .ic{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:hsl(0 0% 100% / .22)!important;font-weight:700;font-size:.85rem}
 .acard .ic svg{width:18px;height:18px}
-.acard .ac-name{font-family:var(--display);font-weight:600;font-size:1.05rem;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.acard .ac-lab{font-size:.72rem;opacity:.85;align-self:end}
+.acard .ac-name{font-family:var(--display);font-weight:600;font-size:1.05rem;line-height:1.25;margin:6px 0 10px;min-width:0;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.acard .ac-lab{font-size:.72rem;opacity:.85;margin-top:auto}
 .acard .ac-bal{font-family:var(--display);font-weight:700;font-size:1.6rem;line-height:1.1;letter-spacing:-.01em;white-space:nowrap}
 .acard .ac-bar{height:6px;border-radius:3px;background:hsl(0 0% 100% / .25);overflow:hidden;margin-top:6px}
 .acard .ac-bar i{display:block;height:100%;background:#fff;border-radius:3px}
@@ -393,3 +393,17 @@ details.more>div{display:grid;gap:10px;padding-bottom:12px}
 .eom-d .eom-tot{font-weight:700;border-top:1px dashed hsl(0 0% 100% / .35);padding-top:6px}
 .eom-d p{margin:2px 0 0;font-size:.76rem;opacity:.85}
 @media (max-width:760px){.acard .ac-bal{font-size:1.45rem}}
+
+/* Sol v4 — préstamos con cobros parciales y opciones de borrado */
+.loan-split{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.loanbar{position:relative;height:10px;border-radius:6px;background:hsl(var(--h) 30% 50% / .2);overflow:hidden;margin:4px 0 2px}
+.loanbar i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+.loanbar span{position:absolute;right:0;top:-18px;font-size:.72rem;color:var(--muted)}
+.pagos{display:grid;gap:6px}
+.pago{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:8px 10px;border-radius:12px;background:hsl(var(--h) 30% 50% / .08)}
+.pago small{display:block;color:var(--muted);font-size:.74rem}
+.pago .pg-s{text-align:right}
+.muted-s{color:var(--muted);font-size:.75rem}
+.delopts{display:flex;flex-wrap:wrap;gap:6px}
+.catrow .inline{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.loan-split .loan-total{font-size:1.35rem;white-space:nowrap}

@@ -1,4 +1,4 @@
-// Mis Finanzas v3 — lógica de la app
+// Sol v4 — lógica de la app
 const FB = "https://www.gstatic.com/firebasejs/10.12.2/";
 const SHEETJS = "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
 
@@ -58,7 +58,7 @@ const recs = () => list("recurrentes");
 const prefs = () => S.docs["ajustes"] || {};
 const cats = tipo => { const a = prefs(); return (tipo==="in"?a.catIn:a.catOut) || (tipo==="in"?DEF_IN:DEF_OUT); };
 const acc = id => accounts().find(a=>a.id===id);
-const curOf = mv => (acc(mv.cuenta)||{}).moneda==="USD" ? "USD" : "PEN";
+const curOf = mv => mv.moneda ? (mv.moneda==="USD"?"USD":"PEN") : (acc(mv.cuenta)||{}).moneda==="USD" ? "USD" : "PEN";
 const monthDocs = () => Object.keys(S.docs).filter(k=>k.startsWith("m-"));
 const docMonthStart = id => { const [,y,m] = id.split("-"); return y+"-"+m+"-01"; };
 function allStored(){ const out=[]; for (const id of monthDocs()) for (const it of docItems(id)) out.push({...it,_doc:id,_date:it.fecha||docMonthStart(id)}); return out; }
@@ -97,29 +97,61 @@ function virtualRecs(from,to){
 
 /* ---------- préstamos ---------- */
 function daysBetween(a,b){ return Math.max(0, Math.round((b - a)/86400000)); }
-function loanCalc(p,atISO){
-  const monto = p.monto||0, tasa = (p.tasa||0)/100;
-  const porDia = monto*tasa/DIAS_MES, porMes = monto*tasa;
-  const ini = parseISO(p.fecha);
-  const at = atISO || todayISO();
-  const fin = p.estado==="pagado" && p.fechaPago ? parseISO(p.fechaPago < at ? p.fechaPago : at) : parseISO(at);
-  const dias = ini ? daysBetween(ini,fin) : 0;
-  const interes = porDia*dias;
-  return {monto,porDia,porMes,dias,interes,total:monto+interes};
+const loanCur = p => p.moneda==="USD" ? "USD" : "PEN";
+/* pagos del préstamo; los préstamos antiguos marcados "pagado" se leen como un cobro total */
+function loanPagos(p){
+  if (Array.isArray(p.pagos)) return p.pagos;
+  if (p.estado==="pagado" && p.fechaPago) return [{id:"legacy",fecha:p.fechaPago,tipo:"total",monto:null,cuenta:p.cuentaCobro||null}];
+  return [];
 }
-const ESTADOS = [["activo","Activo"],["atrasado","Atrasado"],["pagado","Pagado"]];
-const estadoLabel = e => (ESTADOS.find(x=>x[0]===e)||ESTADOS[0])[1];
-const loanLate = p => p.estado==="atrasado" || (p.estado!=="pagado" && p.vence && p.vence<todayISO());
+/* El interés corre por día sobre el capital pendiente. Cada cobro va primero al interés (o al capital, si así lo eliges). */
+function loanCalc(p,atISO){
+  const monto = p.monto||0, tasa = (p.tasa||0)/100, at = atISO || todayISO();
+  const pagos = loanPagos(p).map((x,i)=>({...x,_i:i})).sort((a,b)=>(a.fecha||"").localeCompare(b.fecha||"")||a._i-b._i);
+  let saldo = monto, intPend = 0, intGen = 0, cobCap = 0, cobInt = 0, last = p.fecha||at, fin = null;
+  const det = [];
+  const accrue = to => { if (!to || to<=last) return; if (saldo>0.005){ const g = saldo*tasa/DIAS_MES*daysBetween(parseISO(last),parseISO(to)); intPend+=g; intGen+=g; } last = to; };
+  for (const x of pagos){
+    if (!x.fecha || x.fecha>at || fin) continue;
+    accrue(x.fecha);
+    const m = x.tipo==="total" && x.monto==null ? saldo+intPend : Math.max(0,x.monto||0);
+    let aInt = 0, aCap = 0;
+    if (x.tipo==="total"){ aCap = Math.min(m,saldo); aInt = m-aCap; }
+    else if (x.tipo==="capital"){ aCap = Math.min(m,saldo); aInt = m-aCap; }
+    else { aInt = Math.min(m,intPend); aCap = Math.min(m-aInt,saldo); aInt = m-aCap; }
+    saldo -= aCap; intPend = Math.max(0,intPend-aInt); cobCap += aCap; cobInt += aInt;
+    if (x.tipo==="total"){ saldo = 0; intPend = 0; }
+    det.push({...x,monto:r2(m),capital:r2(aCap),interes:r2(aInt)});
+    if (saldo<=0.005 && intPend<=0.005) fin = x.fecha;
+  }
+  if (!fin) accrue(at);
+  saldo = Math.max(0,saldo);
+  const porMes = saldo*tasa, porDia = porMes/DIAS_MES;
+  const dias = p.fecha ? daysBetween(parseISO(p.fecha),parseISO(fin||at)) : 0;
+  const falta = fin ? 0 : saldo+intPend, cobrado = cobCap+cobInt;
+  return {monto,saldo:fin?0:saldo,intPend:fin?0:intPend,interes:intGen,cobCap,cobInt,cobrado,falta,total:falta,paid:!!fin,fin,porMes:fin?0:porMes,porDia:fin?0:porDia,dias,pagos:det,
+    avance:(cobrado+falta)>0 ? cobrado/(cobrado+falta) : 0};
+}
+const loanPaid = p => loanCalc(p).paid;
+const ESTADOS = [["activo","Al día"],["atrasado","Atrasado"]];
+const estadoLabel = p => loanPaid(p) ? "Cobrado" : (ESTADOS.find(x=>x[0]===p.estado)||ESTADOS[0])[1];
+const loanLate = p => !loanPaid(p) && (p.estado==="atrasado" || (p.vence && p.vence<todayISO()));
+/* suma de préstamos por moneda */
+function loanSums(cur){
+  const ls = loans().filter(p=>loanCur(p)===cur), cs = ls.map(p=>loanCalc(p)), viv = cs.filter(c=>!c.paid);
+  const s = f => cs.reduce((a,c)=>a+f(c),0), sv = f => viv.reduce((a,c)=>a+f(c),0);
+  return {n:ls.length, vivos:viv.length, falta:sv(c=>c.falta), saldo:sv(c=>c.saldo), intPend:sv(c=>c.intPend), porMes:sv(c=>c.porMes), porDia:sv(c=>c.porDia),
+    cobCap:s(c=>c.cobCap), cobInt:s(c=>c.cobInt), cobrado:s(c=>c.cobrado), prestado:s(c=>c.monto)};
+}
 
 /* ---------- movimientos del mes (guardados + programados + intereses cobrados) ---------- */
 function monthMovs(y,m){
   const id = key(y,m), a = monthStart(y,m), b = monthEnd(y,m);
   const stored = docItems(id).map(it=>({...it,_doc:id,_date:it.fecha||a}));
   const virt = virtualRecs(a,b);
-  const interest = loans().filter(p=>p.estado==="pagado" && p.fechaPago>=a && p.fechaPago<=b).map(p=>{
-    const c = loanCalc(p);
-    return {id:"i-"+p.id,virtual:"loan",loanId:p.id,tipo:"in",concepto:"Interés · "+(p.nombre||"préstamo"),cat:"Intereses de préstamos",fecha:p.fechaPago,plan:null,real:r2(c.interes),cuenta:null,_date:p.fechaPago};
-  }).filter(x=>x.real>0);
+  const interest = [];
+  for (const p of loans()) for (const x of loanCalc(p).pagos) if (x.fecha>=a && x.fecha<=b && x.interes>0)
+    interest.push({id:"i-"+p.id+"-"+x.id,virtual:"loan",loanId:p.id,tipo:"in",concepto:"Interés · "+(p.nombre||"préstamo"),cat:"Intereses de préstamos",fecha:x.fecha,plan:null,real:x.interes,cuenta:x.cuenta||null,moneda:loanCur(p),_date:x.fecha});
   return [...stored,...virt,...interest];
 }
 function totals(listM){
@@ -149,7 +181,7 @@ function ledger(){
   }
   for (const p of loans()){
     if (p.cuenta && p.fecha) ev.push({date:p.fecha,cuenta:p.cuenta,amt:-(p.monto||0),label:"Préstamo a "+(p.nombre||"")});
-    if (p.estado==="pagado" && p.cuentaCobro && p.fechaPago) ev.push({date:p.fechaPago,cuenta:p.cuentaCobro,amt:loanCalc(p).total,label:"Cobro de "+(p.nombre||"")});
+    for (const x of loanCalc(p).pagos) if (x.cuenta) ev.push({date:x.fecha,cuenta:x.cuenta,amt:x.monto,label:(x.tipo==="capital"?"Abono de capital · ":x.tipo==="interes"?"Interés · ":"Cobro de ")+(p.nombre||"")});
   }
   for (const d of debts()) for (const a of d.abonos||[]) if (a.cuenta) ev.push({date:a.fecha,cuenta:a.cuenta,amt:-(a.monto||0),label:"Abono · "+(d.nombre||"")});
   for (const g of goals()) for (const a of g.aportes||[]) if (a.cuenta) ev.push({date:a.fecha,cuenta:a.cuenta,amt:-(a.monto||0),label:(a.monto<0?"Retiro de meta · ":"Meta · ")+(g.nombre||"")});
@@ -180,7 +212,7 @@ function worth(atISO){
   const at = atISO || todayISO();
   const cash = available(atISO).PEN;
   const metas = goals().reduce((s,g)=>s+goalSaved(g,atISO),0);
-  const capital = loans().filter(p=>p.fecha && p.fecha<=at && !(p.estado==="pagado" && p.fechaPago && p.fechaPago<=at)).reduce((s,p)=>s+(p.monto||0),0);
+  const capital = loans().filter(p=>loanCur(p)==="PEN" && p.fecha && p.fecha<=at).reduce((s,p)=>s+loanCalc(p,at).saldo,0);
   const tarjetas = cardsDebt(atISO);
   const deuda = debts().reduce((s,d)=>s+Math.max(0,(d.total||0)-debtPaid(d,atISO)),0) + tarjetas;
   return {cash,metas,capital,deuda,tarjetas,neto:cash+metas+capital-deuda};
@@ -192,8 +224,9 @@ function eventsBetween(a,b){
   const stored = allStored().filter(it=>it.fecha && it.fecha>=a && it.fecha<=b);
   for (const it of [...stored,...virtualRecs(a,b)]) out.push({date:it.fecha,kind:it.tipo==="in"?"in":it.tipo==="tr"?"tr":"out",title:it.concepto||it.cat||"Movimiento",amt:it.real!=null?it.real:(it.plan||0),cur:curOf(it),done:isDone(it),item:it});
   for (const p of loans()){
-    if (p.vence && p.estado!=="pagado" && p.vence>=a && p.vence<=b) out.push({date:p.vence,kind:"loan",title:"Cobrar a "+(p.nombre||""),amt:loanCalc(p,p.vence).total,done:false,loan:p});
-    if (p.estado==="pagado" && p.fechaPago>=a && p.fechaPago<=b) out.push({date:p.fechaPago,kind:"loan",title:"Cobrado · "+(p.nombre||""),amt:loanCalc(p).total,done:true,loan:p});
+    const c = loanCalc(p), cur = loanCur(p);
+    if (p.vence && !c.paid && p.vence>=a && p.vence<=b) out.push({date:p.vence,kind:"loan",title:"Cobrar a "+(p.nombre||""),amt:loanCalc(p,p.vence<todayISO()?todayISO():p.vence).falta,cur,done:false,loan:p});
+    for (const x of c.pagos) if (x.fecha>=a && x.fecha<=b) out.push({date:x.fecha,kind:"loan",title:(c.fin===x.fecha?"Cobrado · ":"Cobro parcial · ")+(p.nombre||""),amt:x.monto,cur,done:true,loan:p});
   }
   for (const d of debts()){
     const pend = (d.total||0)-debtPaid(d);
@@ -237,7 +270,7 @@ function endOfMonth(y,m,t){
   const ev = eventsBetween(monthStart(y,m),b);
   const cuotas = ev.filter(e=>e.kind==="debt" && !e.done && e.amt).reduce((s,e)=>s+e.amt,0);
   const cards = ev.filter(e=>e.kind==="card" && !e.done && e.cur!=="USD").reduce((s,e)=>s+(e.amt||0),0);
-  const cobros = ev.filter(e=>e.kind==="loan" && !e.done).reduce((s,e)=>s+(e.amt||0),0);
+  const cobros = ev.filter(e=>e.kind==="loan" && !e.done && e.cur!=="USD").reduce((s,e)=>s+(e.amt||0),0);
   const parts = [["Dinero que tienes hoy",cash],["Ingresos que faltan recibir",pin]];
   if (cobros) parts.push(["Cobros de préstamos que vencen este mes",cobros]);
   parts.push(["Gastos programados que faltan pagar",-pout]);
@@ -352,9 +385,28 @@ function saveMov(rec,oldDoc){
   pairs.push([target,{items:exists?cur.map(x=>x.id===rec.id?rec:x):[...cur,rec],anio:d.getFullYear(),mes:d.getMonth()+1}]);
   saveMany(pairs);
 }
-function removeMov(it){
-  if (it.virtual==="rec"){ const r = recs().find(x=>x.id===it.recId); if (r) withUndo(["recurrentes"],()=>setList("recurrentes",recs().map(x=>x.id===r.id?{...x,omit:[...(x.omit||[]),it.recDate]}:x)),"Omití esta fecha."); return; }
+function removeMov(it,scope){
+  const r = it.recId ? recs().find(x=>x.id===it.recId) : null;
+  const day = it.recDate || it.fecha;
+  if (r && scope==="future"){
+    const docs = monthDocs().filter(id=>docItems(id).some(x=>x.recId===r.id && (x.recDate||x.fecha)>=day));
+    withUndo(["recurrentes",...docs],()=>{
+      const fin = addDays(day,-1);
+      const pairs = [["recurrentes",{...(S.docs.recurrentes||{}),items: fin<r.inicio ? recs().filter(x=>x.id!==r.id) : recs().map(x=>x.id===r.id?{...x,fin}:x)}]];
+      for (const id of docs) pairs.push([id,{...(S.docs[id]||{}),items:docItems(id).filter(x=>!(x.recId===r.id && (x.recDate||x.fecha)>=day))}]);
+      saveMany(pairs);
+    },"Eliminé este y los siguientes.");
+    return;
+  }
+  if (it.virtual==="rec"){ if (r) withUndo(["recurrentes"],()=>setList("recurrentes",recs().map(x=>x.id===r.id?{...x,omit:[...(x.omit||[]),it.recDate]}:x)),"Eliminé solo esta fecha."); return; }
+  if (r && it.recDate){
+    withUndo([it._doc,"recurrentes"],()=>saveMany([[it._doc,{...(S.docs[it._doc]||{}),items:docItems(it._doc).filter(x=>x.id!==it.id)}],["recurrentes",{...(S.docs.recurrentes||{}),items:recs().map(x=>x.id===r.id?{...x,omit:[...(x.omit||[]),it.recDate]}:x)}]]),"Movimiento eliminado.");
+    return;
+  }
   withUndo([it._doc],()=>setList(it._doc,docItems(it._doc).filter(x=>x.id!==it.id)),"Movimiento eliminado.");
+}
+function removeRec(r){
+  withUndo(["recurrentes"],()=>setList("recurrentes",recs().filter(x=>x.id!==r.id)),"Repetición eliminada. Lo ya registrado se mantiene.");
 }
 
 /* ======================= utilidades DOM ======================= */
@@ -477,7 +529,7 @@ function renderHeader(){
   $("hello-name").textContent = first ? "Hola, "+first : "Hola 👋";
   const av = $("avatar");
   if (S.photo){ const img = h("img",{src:S.photo,alt:"",referrerpolicy:"no-referrer",class:"avatar",id:"avatar"}); img.onerror=()=>{ const s=h("span",{class:"avatar",id:"avatar",text:initials(S.name||S.email)}); img.replaceWith(s); }; av.replaceWith(img); }
-  else av.textContent = initials(S.name||S.email||"Mis Finanzas");
+  else av.textContent = initials(S.name||S.email||"Sol");
 }
 function renderNav(){
   const periodic = S.view==="inicio"||S.view==="calendario";
@@ -602,18 +654,17 @@ const MODULES = {
   },
 
   prestamos: () => {
-    const vivos = loans().filter(p=>p.estado!=="pagado"), pag = loans().filter(p=>p.estado==="pagado");
-    const capital = vivos.reduce((s,p)=>s+(p.monto||0),0), acum = vivos.reduce((s,p)=>s+loanCalc(p).interes,0);
-    const cobrado = pag.reduce((s,p)=>s+(p.interesCobrado??loanCalc(p).interes),0);
+    const L = loanSums("PEN"), U = loanSums("USD");
     const pend = debts().reduce((s,d)=>s+Math.max(0,(d.total||0)-debtPaid(d)),0), pagado = debts().reduce((s,d)=>s+debtPaid(d),0);
     if (!loans().length && !debts().length) return mod("prestamos",{title:"Préstamos y deudas",icon:"prestamos",defOpen:false,summary:"Sin préstamos ni deudas registradas",body:()=>[h("div",{class:"mod-act"},h("button",{class:"btn sm",onclick:()=>{S.pd="p";go("prestamos");}},"Registrar préstamo"),h("button",{class:"btn ghost sm",onclick:()=>{S.pd="d";go("prestamos");}},"Registrar deuda"))]});
     const prox = eventsBetween(todayISO(),addDays(todayISO(),60)).find(e=>!e.done&&(e.kind==="loan"||e.kind==="debt"));
     return mod("prestamos",{title:"Préstamos y deudas",icon:"prestamos",defOpen:false,
-      summary:["Te deben ",h("strong",{text:money(capital+acum)})," · debes ",h("strong",{text:money(pend)})],
+      summary:["Te deben ",h("strong",{text:money(L.falta)}),U.vivos?" + "+money(U.falta,"USD"):""," · debes ",h("strong",{text:money(pend)})],
       body:()=>[h("div",{class:"mini-list"},
-        h("div",null,h("span",{text:"Capital por recuperar"}),h("b",{text:money(capital)})),
-        h("div",null,h("span",{text:"Intereses acumulados (aún no cobrados)"}),h("b",{text:money(acum)})),
-        h("div",null,h("span",{text:"Intereses cobrados"}),h("b",{class:"pos",text:money(cobrado)})),
+        h("div",null,h("span",{text:"Capital por recuperar"}),h("b",{text:money(L.saldo)})),
+        h("div",null,h("span",{text:"Intereses acumulados (aún no cobrados)"}),h("b",{text:money(L.intPend)})),
+        h("div",null,h("span",{text:"Ya cobrado (capital + interés)"}),h("b",{class:"pos",text:money(L.cobrado)})),
+        U.n ? h("div",null,h("span",{text:"En dólares: te falta cobrar"}),h("b",{text:money(U.falta,"USD")})) : null,
         h("div",null,h("span",{text:"Deudas pendientes"}),h("b",{class:pend?"neg":"",text:money(pend)})),
         h("div",null,h("span",{text:"Pagos realizados a deudas"}),h("b",{text:money(pagado)})),
         prox ? h("div",null,h("span",{text:"Próximo vencimiento"}),h("b",{text:prox.title+" · "+fshort(prox.date)})) : null),
@@ -842,37 +893,52 @@ function viewPD(){
   return [seg, ...(S.pd==="p" ? viewLoans() : viewDebts())];
 }
 function viewLoans(){
-  const all = loans(), vivos = all.filter(p=>p.estado!=="pagado"), pagados = all.filter(p=>p.estado==="pagado");
-  const sum = (arr,f) => arr.reduce((a,p)=>a+f(loanCalc(p)),0);
-  const capital = sum(vivos,c=>c.monto), porMes = sum(vivos,c=>c.porMes), porDia = sum(vivos,c=>c.porDia), cobrar = sum(vivos,c=>c.total);
-  const cobrado = pagados.reduce((s,p)=>s+(p.interesCobrado??loanCalc(p).interes),0);
-  const out = [heroBox("Total a cobrar hoy", cobrar, [["Capital",money(capital)],["Interés acumulado",money(cobrar-capital)],["Genera al mes",money(porMes)]],
-    h("span",{class:"hproj"},"Genera ",h("b",{text:money(porDia)})," por día · intereses ya cobrados: ",h("b",{text:money(cobrado)})))];
+  const all = loans(), vivos = all.filter(p=>!loanPaid(p)), pagados = all.filter(p=>loanPaid(p));
+  const L = loanSums("PEN"), U = loanSums("USD");
+  const usdLine = U.n ? h("span",{class:"hproj"},"En dólares: te falta cobrar ",h("b",{text:money(U.falta,"USD")})," · ya cobraste ",h("b",{text:money(U.cobrado,"USD")})) : null;
+  const out = [heroBox("Te falta cobrar", L.falta, [["Capital pendiente",money(L.saldo)],["Interés acumulado",money(L.intPend)],["Ya cobraste",money(L.cobrado)]],
+    h("div",{style:"display:grid;gap:4px"},h("span",{class:"hproj"},"Genera ",h("b",{text:money(L.porDia)})," por día · ",h("b",{text:money(L.porMes)})," al mes · intereses cobrados: ",h("b",{text:money(L.cobInt)})),usdLine))];
   out.push(h("section",null,
     h("div",{class:"sechead"},h("h2",{text:"Préstamos activos"}),h("button",{class:"btn sm",onclick:()=>openLoan({})},"+ Nuevo préstamo")),
     vivos.length ? h("div",{class:"glass"},h("div",{class:"lrows"},vivos.sort((a,b)=>(a.fecha||"").localeCompare(b.fecha||"")).map(loanRow)))
-      : h("div",{class:"glass list"},h("div",{class:"empty"},h("p",{text:all.length?"No tienes préstamos activos.":"Aquí controlas el dinero que prestas. Anota el monto, el % mensual y la fecha: la app calcula cuánto te deben al día de hoy."}),!all.length?h("div",{class:"btnrow"},h("button",{class:"btn",onclick:()=>openLoan({})},"+ Registrar mi primer préstamo")):null))));
-  if (pagados.length) out.push(h("section",null,h("div",{class:"sechead"},h("h2",{text:"Cobrados"}),h("span",{class:"tot",text:pagados.length+" préstamos"})),h("div",{class:"glass"},h("div",{class:"lrows"},pagados.map(loanRow)))));
+      : h("div",{class:"glass list"},h("div",{class:"empty"},h("p",{text:all.length?"No tienes préstamos activos.":"Aquí controlas el dinero que prestas, en soles o dólares. Anota el monto, el % mensual y la fecha: la app calcula cuánto te deben al día de hoy y cuánto te van pagando."}),!all.length?h("div",{class:"btnrow"},h("button",{class:"btn",onclick:()=>openLoan({})},"+ Registrar mi primer préstamo")):null))));
+  if (pagados.length) out.push(h("section",null,h("div",{class:"sechead"},h("h2",{text:"Cobrados"}),h("span",{class:"tot",text:pagados.length+(pagados.length===1?" préstamo":" préstamos")})),h("div",{class:"glass"},h("div",{class:"lrows"},pagados.map(loanRow)))));
   return out;
 }
+function removePago(p,x){
+  withUndo(["prestamos"],()=>setList("prestamos",loans().map(l=>l.id===p.id?{...l,pagos:loanPagos(l).filter(y=>y.id!==x.id),estado:l.estado==="pagado"?"activo":l.estado,fechaPago:null,cuentaCobro:null,interesCobrado:null}:l)),"Cobro eliminado.");
+}
+const PAGO_TIPO = {interes:"Interés",capital:"Capital",total:"Liquidación"};
 function loanRow(p){
-  const c = loanCalc(p), paid = p.estado==="pagado", late = loanLate(p);
+  const c = loanCalc(p), cur = loanCur(p), paid = c.paid, late = loanLate(p), mo = v => money(v,cur);
   const ic = h("span",{class:"ic",text:initials(p.nombre)});
   return lrow({id:"loan-"+p.id, ic, c:p.nombre||"Sin nombre",
-    m:money(c.monto)+" prestado",
-    a: paid ? money(c.total) : "+"+money(c.porMes)+"/mes",
-    p: h("span",{class:"state "+(paid?"pagado":late?"atrasado":"activo"),text:paid?"Cobrado":late?"Atrasado":"Activo"}),
+    m: pct(c.avance)+" cobrado de "+mo(c.monto),
+    a: paid ? "Cobrado ✓" : mo(c.falta),
+    p: h("span",null, !paid ? h("span",{class:"muted-s",text:"falta "}) : null, h("span",{class:"state "+(paid?"pagado":late?"atrasado":"activo"),text:paid?"Cobrado":late?"Atrasado":"Activo"})),
+    extra: h("span",{class:"thin"},h("div",{style:"width:"+c.avance*100+"%"})),
     body:()=>[
-      h("div",null,h("div",{class:"note",text:paid?"Cobraste en total":"Cobro a hoy"}),h("div",{class:"loan-total",text:money(c.total)})),
+      h("div",{class:"loan-split"},
+        h("div",null,h("div",{class:"note",text:"Ya cobraste"}),h("div",{class:"loan-total pos",text:mo(c.cobrado)})),
+        h("div",null,h("div",{class:"note",text:paid?"Préstamo terminado":"Falta para terminar"}),h("div",{class:"loan-total",text:mo(c.falta)}))),
+      h("div",{class:"loanbar"},h("i",{style:"width:"+c.avance*100+"%"}),h("span",{text:pct(c.avance)})),
       h("div",{class:"loan-grid"},
-        h("div",null,h("span",{text:"Capital prestado"}),h("b",{text:money(c.monto)})),
-        h("div",null,h("span",{text:paid?"Interés cobrado":"Interés acumulado"}),h("b",{text:money(paid?(p.interesCobrado??c.interes):c.interes)})),
-        h("div",null,h("span",{text:"Interés mensual"}),h("b",{text:(p.tasa||0)+"% · "+money(c.porMes)})),
-        h("div",null,h("span",{text:"Genera por día"}),h("b",{text:money(c.porDia)})),
+        h("div",null,h("span",{text:"Capital prestado"}),h("b",{text:mo(c.monto)})),
+        h("div",null,h("span",{text:"Capital pendiente"}),h("b",{text:mo(c.saldo)})),
+        h("div",null,h("span",{text:"Capital recuperado"}),h("b",{text:mo(c.cobCap)})),
+        h("div",null,h("span",{text:"Interés cobrado"}),h("b",{class:"pos",text:mo(c.cobInt)})),
+        !paid ? h("div",null,h("span",{text:"Interés por cobrar"}),h("b",{text:mo(c.intPend)})) : null,
+        h("div",null,h("span",{text:"Interés mensual"}),h("b",{text:(p.tasa||0)+"%"+(paid?"":" · "+mo(c.porMes))})),
+        !paid ? h("div",null,h("span",{text:"Genera por día"}),h("b",{text:mo(c.porDia)})) : null,
         h("div",null,h("span",{text:"Desde "+fdate(p.fecha)}),h("b",{text:c.dias+(c.dias===1?" día":" días")})),
         p.vence ? h("div",null,h("span",{text:"Vence"}),h("b",{text:fdate(p.vence)})) : null,
-        paid ? h("div",null,h("span",{text:"Cobrado el"}),h("b",{text:fdate(p.fechaPago)})) : null),
-      h("div",{class:"inline"}, !paid ? h("button",{class:"btn sm",onclick:()=>openPaid(p)},"Cobrar") : null, h("button",{class:"btn ghost sm",onclick:()=>openLoan(p)},"Editar"))]});
+        paid ? h("div",null,h("span",{text:"Terminó de pagar"}),h("b",{text:fdate(c.fin)})) : null),
+      c.pagos.length ? h("div",{class:"pagos"},h("div",{class:"subhead",style:"margin:4px 0",text:"Cobros recibidos"}),
+        c.pagos.slice().reverse().map(x=>h("div",{class:"pago"},
+          h("span",{class:"pg-d"},h("b",{text:fdate(x.fecha)}),h("small",{text:PAGO_TIPO[x.tipo]||"Cobro"})),
+          h("span",{class:"pg-s"},h("b",{text:"+"+mo(x.monto)}),h("small",{text:[x.capital>0?"capital "+mo(x.capital):null,x.interes>0?"interés "+mo(x.interes):null].filter(Boolean).join(" · ")})),
+          delBtn("Quitar",()=>removePago(p,x))))) : null,
+      h("div",{class:"inline"}, !paid ? h("button",{class:"btn sm",onclick:()=>openPaid(p)},"Registrar cobro") : null, h("button",{class:"btn ghost sm",onclick:()=>openLoan(p)},"Editar"))]});
 }
 function viewDebts(){
   const list = debts();
@@ -996,8 +1062,10 @@ function viewAjustes(){
   if (rs.length) out.push(h("section",null,h("div",{class:"sechead"},h("h2",{text:"Movimientos recurrentes"})),
     h("div",{class:"glass list"},rs.map(r=>{
       const active = !r.fin || r.fin>=todayISO();
-      return h("div",{class:"catrow"},h("span",null,r.concepto+" · "+money(r.importe)+" · "+((FREQS.find(f=>f[0]===r.freq)||["",""])[1]).toLowerCase(),!active?h("span",{class:"tag",text:"Detenido"}):null),
-        active ? delBtn("Detener",()=>{ setList("recurrentes",recs().map(x=>x.id===r.id?{...x,fin:addDays(todayISO(),-1)}:x)); toast("Ya no se repetirá. Lo registrado se mantiene."); }) : null);
+      return h("div",{class:"catrow"},h("span",null,(r.tipo==="in"?"+ ":"− ")+r.concepto+" · "+money(r.importe,curOf(r))+" · "+((FREQS.find(f=>f[0]===r.freq)||["",""])[1]).toLowerCase(),!active?h("span",{class:"tag",text:"Detenido"}):null),
+        h("div",{class:"inline"},
+          active ? delBtn("Detener",()=>{ setList("recurrentes",recs().map(x=>x.id===r.id?{...x,fin:addDays(todayISO(),-1)}:x)); toast("Ya no se repetirá. Lo registrado se mantiene."); }) : null,
+          delBtn("Eliminar",()=>removeRec(r))));
     }))));
 
   const catSection = tipo => {
@@ -1114,7 +1182,9 @@ function openMov(it){
     const setT = v => { tipo=v; bIn.setAttribute("aria-pressed",String(v==="in")); bOut.setAttribute("aria-pressed",String(v==="out")); fillCats(); doneLab.textContent = v==="in"?"Ya lo recibí":"Ya lo pagué"; };
     bIn.onclick = () => setT("in"); bOut.onclick = () => setT("out");
     const doneLab = h("span",{text:tipo==="in"?"Ya lo recibí":"Ya lo pagué"});
-    const del = (!it.id || it.virtual==="loan") ? null : delBtn(it.virtual==="rec"?"Omitir esta vez":"Eliminar",()=>{ close(); removeMov(it); });
+    const del = (!it.id || it.virtual==="loan") ? null
+      : it.recId ? h("div",{class:"delopts"},delBtn("Eliminar solo este",()=>{ close(); removeMov(it,"one"); }),delBtn("Este y los siguientes",()=>{ close(); removeMov(it,"future"); }))
+      : delBtn("Eliminar",()=>{ close(); removeMov(it); });
     const moreOpen = !!(it.nota || (plan.value!==""));
     return h("form",{style:"display:grid;gap:12px",onsubmit:e=>{
       e.preventDefault();
@@ -1209,52 +1279,81 @@ function openAccount(a){
 
 /* ---------- préstamos: formularios ---------- */
 function openLoan(p){
-  const isNew = !p.id; let estado = p.estado||"activo";
+  const isNew = !p.id; let estado = p.estado==="atrasado" ? "atrasado" : "activo"; let moneda = loanCur(p);
   modal(close=>{
     const nombre = h("input",{id:"l-nombre",value:p.nombre||"",placeholder:"Ej. Juan Pérez"});
     const monto = amountInput("l-monto",p.monto);
     const tasa = h("input",{id:"l-tasa",type:"number",inputmode:"decimal",step:"0.01",min:"0",value:p.tasa??"",placeholder:"Ej. 10"});
     const fecha = h("input",{id:"l-fecha",type:"date",value:p.fecha||todayISO()});
-    const cuenta = accSelect("l-acc",p.cuenta||"",true,"No salió de una cuenta");
+    const cuenta = h("select",{id:"l-acc"});
+    const fillAcc = () => { const v = cuenta.value || p.cuenta || ""; cuenta.replaceChildren(h("option",{value:""},"No salió de una cuenta"),...accounts().filter(a=>(!a.archivada||a.id===v) && (a.moneda==="USD"?"USD":"PEN")===moneda).map(a=>h("option",{value:a.id,selected:a.id===v},a.nombre))); };
     const vence = h("input",{id:"l-vence",type:"date",value:p.vence||""});
     const preview = h("div",{class:"calc"});
     const seg = h("div",{class:"seg"});
-    const drawSeg = () => seg.replaceChildren(...ESTADOS.filter(x=>x[0]!=="pagado"||!isNew).map(([v,l])=>h("button",{type:"button","aria-pressed":String(estado===v),onclick:()=>{estado=v;drawSeg();upd();}},l)));
-    const upd = () => { const c = loanCalc({monto:num(monto.value)||0,tasa:num(tasa.value)||0,fecha:fecha.value,estado,fechaPago:p.fechaPago});
-      preview.replaceChildren(h("span",null,"Gana ",h("b",{text:money(c.porMes)})," al mes · ",money(c.porDia)," por día"),h("span",null,c.dias+" días → cobro a hoy: ",h("b",{text:money(c.total)}))); };
+    const curSeg = h("div",{class:"seg"});
+    const drawCur = () => curSeg.replaceChildren(...[["PEN","Soles (S/)"],["USD","Dólares (US$)"]].map(([v,l])=>h("button",{type:"button","aria-pressed":String(moneda===v),onclick:()=>{moneda=v;drawCur();fillAcc();upd();}},l)));
+    const drawSeg = () => seg.replaceChildren(...ESTADOS.map(([v,l])=>h("button",{type:"button","aria-pressed":String(estado===v),onclick:()=>{estado=v;drawSeg();}},l)));
+    const upd = () => { const c = loanCalc({...p,monto:num(monto.value)||0,tasa:num(tasa.value)||0,fecha:fecha.value});
+      preview.replaceChildren(h("span",null,"Gana ",h("b",{text:money(c.porMes,moneda)})," al mes · ",money(c.porDia,moneda)," por día"),h("span",null,c.dias+" días → "+(c.paid?"ya está cobrado":"te deben hoy: "),c.paid?null:h("b",{text:money(c.falta,moneda)}))); };
     for (const el of [monto,tasa,fecha]) el.addEventListener("input",upd);
-    drawSeg(); upd();
+    drawCur(); fillAcc(); drawSeg(); upd();
     const del = isNew ? null : delBtn("Eliminar",()=>{ close(); withUndo(["prestamos"],()=>setList("prestamos",loans().filter(x=>x.id!==p.id)),"Préstamo eliminado."); });
     return h("form",{style:"display:grid;gap:12px",onsubmit:e=>{
       e.preventDefault();
-      const rec = {...p,id:p.id||uid(),nombre:nombre.value.trim()||"Sin nombre",monto:num(monto.value)||0,tasa:num(tasa.value)||0,fecha:fecha.value||todayISO(),estado,cuenta:cuenta.value||null,vence:vence.value||null};
-      if (estado!=="pagado"){ rec.fechaPago=null; rec.cuentaCobro=null; rec.interesCobrado=null; }
+      const rec = {...p,id:p.id||uid(),nombre:nombre.value.trim()||"Sin nombre",moneda,monto:num(monto.value)||0,tasa:num(tasa.value)||0,fecha:fecha.value||todayISO(),cuenta:cuenta.value||null,vence:vence.value||null};
+      rec.pagos = loanPagos(p); rec.estado = estado; rec.fechaPago = null; rec.cuentaCobro = null; rec.interesCobrado = null;
       if (rec.monto<=0){ toast("Escribe el monto que prestaste."); return; }
       setList("prestamos", isNew?[...loans(),rec]:loans().map(x=>x.id===rec.id?rec:x)); close(); toast(isNew?"Préstamo registrado ✓":"Guardado ✓");
     }},
       h("h3",{text:isNew?"Nuevo préstamo":"Editar préstamo"}),
-      field("¿A quién le prestaste?",nombre), monto,
+      field("¿A quién le prestaste?",nombre),
+      h("div",{class:"field"},h("label",{text:"Moneda"}),curSeg),
+      monto,
       h("div",{class:"two"},field("Interés mensual (%)",tasa),field("Fecha del préstamo",fecha)),
       preview,
       h("details",{class:"more",open:!!(p.vence||p.cuenta||!isNew)||null},h("summary",null,"Más opciones"),h("div",null,
         field("¿De qué cuenta salió el dinero?",cuenta), field("Fecha de vencimiento (opcional)",vence),
-        !isNew ? h("div",{class:"field"},h("label",{text:"Estado"}),seg) : null,
-        h("p",{class:"note",style:"margin:0",text:"El interés se cobra por día: el % mensual entre 30, por cada día que pasa. El capital no cuenta como ganancia."}))),
+        h("div",{class:"field"},h("label",{text:"Estado"}),seg),
+        h("p",{class:"note",style:"margin:0",text:"El interés se cobra por día: el % mensual entre 30, por cada día, sobre el capital que falta devolver. Los cobros parciales se registran con “Registrar cobro”."}))),
       actions(close,del));
   });
 }
 function openPaid(p){
+  const cur = loanCur(p); let tipo = "interes";
   modal(close=>{
     const fp = h("input",{id:"p-fecha",type:"date",value:todayISO()});
-    const cuenta = accSelect("p-acc",p.cuenta||lastAcc(),true,"No entró a una cuenta");
+    const cuenta = h("select",{id:"p-acc"},h("option",{value:""},"No entró a una cuenta"),...accounts().filter(a=>!a.archivada && !isCredit(a) && (a.moneda==="USD"?"USD":"PEN")===cur).map(a=>h("option",{value:a.id,selected:a.id===(p.cuenta||lastAcc())},a.nombre)));
+    const amt = amountInput("p-amt","");
+    const seg = h("div",{class:"seg"});
+    const hint = h("p",{class:"note",style:"margin:0"});
     const info = h("div",{class:"calc"});
-    const upd = () => { const c = loanCalc({...p,estado:"pagado",fechaPago:fp.value}); info.replaceChildren(h("span",null,"Capital que vuelve: ",money(c.monto)),h("span",null,"Interés ganado ("+c.dias+" días): ",h("b",{class:"pos",text:money(c.interes)})),h("span",null,"Total que recibes: ",h("b",{text:money(c.total)}))); };
-    fp.addEventListener("input",upd); upd();
+    const HINT = {interes:"Se descuenta del interés acumulado. Si te pagan más, el resto baja el capital.",capital:"Baja el capital que te deben. Desde esa fecha el interés se calcula sobre lo que queda.",total:"Cierra el préstamo: devuelve todo el capital y lo demás cuenta como interés."};
+    const before = () => loanCalc(p, fp.value||todayISO());
+    const setDef = () => { const b = before(); amt.value = tipo==="interes" ? (b.intPend>0.004?r2(b.intPend):"") : tipo==="total" ? r2(b.falta) : ""; hint.textContent = HINT[tipo]; upd(); };
+    const drawSeg = () => seg.replaceChildren(...[["interes","Interés"],["capital","Parte del capital"],["total","Todo"]].map(([v,l])=>h("button",{type:"button","aria-pressed":String(tipo===v),onclick:()=>{tipo=v;drawSeg();setDef();}},l)));
+    const upd = () => {
+      const f = fp.value||todayISO(), b = before(), v = num(amt.value)||0;
+      const after = loanCalc({...p,pagos:[...loanPagos(p),{id:"tmp",fecha:f,tipo,monto:v}]}, f);
+      const x = after.pagos.find(y=>y.id==="tmp") || {capital:0,interes:0};
+      info.replaceChildren(
+        h("span",null,"Hoy te debe: ",h("b",{text:money(b.falta,cur)})," (capital ",money(b.saldo,cur)," + interés ",money(b.intPend,cur),")"),
+        v>0 ? h("span",null,"Este cobro: ",h("b",{text:money(x.capital,cur)})," a capital · ",h("b",{class:"pos",text:money(x.interes,cur)})," a interés") : null,
+        v>0 ? (after.paid ? h("span",null,h("b",{class:"pos",text:"Con esto termina de pagar ✓"})) : h("span",null,"Después le faltará: ",h("b",{text:money(after.falta,cur)})," · ",pct(after.avance)," cobrado")) : null);
+    };
+    fp.addEventListener("input",()=>{ if (tipo!=="capital") setDef(); else upd(); }); amt.addEventListener("input",upd);
+    drawSeg(); setDef();
     return h("form",{style:"display:grid;gap:12px",onsubmit:e=>{
-      e.preventDefault(); const f = fp.value||todayISO(); const c = loanCalc({...p,estado:"pagado",fechaPago:f});
-      setList("prestamos",loans().map(x=>x.id===p.id?{...x,estado:"pagado",fechaPago:f,cuentaCobro:cuenta.value||null,interesCobrado:r2(c.interes)}:x)); close(); toast("Cobrado ✓ El interés se sumó como ingreso del mes.");
-    }}, h("h3",{text:"Cobrar a "+(p.nombre||"")}), h("div",{class:"two"},field("Fecha de pago",fp),field("¿A qué cuenta entró?",cuenta)), info,
-      h("p",{class:"note",style:"margin:0",text:"Desde esta fecha deja de sumar interés. Solo el interés cuenta como ingreso; el capital es tu dinero que vuelve."}), actions(close,null,"Marcar cobrado"));
+      e.preventDefault(); const f = fp.value||todayISO(); const v = num(amt.value);
+      if (!v || v<=0){ toast("Escribe el monto que te pagaron."); amt.focus(); return; }
+      const pago = {id:uid(),fecha:f,tipo,monto:v,cuenta:cuenta.value||null};
+      setLastAcc(cuenta.value);
+      setList("prestamos",loans().map(x=>x.id===p.id?{...x,pagos:[...loanPagos(x),pago],estado:x.estado==="pagado"?"activo":x.estado,fechaPago:null,cuentaCobro:null,interesCobrado:null}:x));
+      const after = loanCalc(loans().find(x=>x.id===p.id)||p);
+      close(); toast(after.paid ? "¡Préstamo cobrado completo! ✓" : "Cobro de "+money(v,cur)+" registrado · falta "+money(after.falta,cur));
+    }}, h("h3",{text:"Registrar cobro · "+(p.nombre||"")}),
+      h("div",{class:"field"},h("label",{text:"¿Qué te pagó?"}),seg), hint, amt,
+      h("div",{class:"two"},field("Fecha del pago",fp),field("¿A qué cuenta entró?",cuenta)), info,
+      h("p",{class:"note",style:"margin:0",text:"Solo la parte de interés cuenta como ingreso del mes; el capital es tu dinero que vuelve."}), actions(close,null,"Registrar cobro"));
   });
 }
 
@@ -1334,7 +1433,7 @@ async function exportYear(){
   const movs = m => [["Fecha","Tipo","Concepto","Categoría","Cuenta","Planeado","Real","Estado"],
     ...monthMovs(y,m).map(i=>[fdate(i.fecha),i.tipo==="in"?"Ingreso":i.tipo==="tr"?"Transferencia":"Gasto",i.concepto||"",i.cat||"",(acc(i.cuenta)||{}).nombre||"",i.plan,i.real,isDone(i)?"Realizado":"Programado"])];
   const ctas = [["Cuenta","Tipo","Moneda","Saldo"],...accounts().map(a=>[a.nombre,(TIPOS_CUENTA.find(x=>x[0]===a.tipo)||["",""])[1],a.moneda||"PEN",r2(bal[a.id])])];
-  const pres = [["Persona","Monto","% mensual","Fecha","Estado","Días","Interés","Total"],...loans().map(p=>{ const c=loanCalc(p); return [p.nombre,c.monto,p.tasa,fdate(p.fecha),estadoLabel(p.estado),c.dias,r2(c.interes),r2(c.total)]; })];
+  const pres = [["Persona","Moneda","Monto","% mensual","Fecha","Estado","Días","Capital pendiente","Interés por cobrar","Ya cobrado","Falta cobrar"],...loans().map(p=>{ const c=loanCalc(p); return [p.nombre,loanCur(p)==="USD"?"US$":"S/",c.monto,p.tasa,fdate(p.fecha),estadoLabel(p),c.dias,r2(c.saldo),r2(c.intPend),r2(c.cobrado),r2(c.falta)]; })];
   const deu = [["Deuda","Monto total","Abonado","Restante"],...debts().map(d=>[d.nombre,d.total,r2(debtPaid(d)),r2((d.total||0)-debtPaid(d))])];
   const met = [["Meta","Objetivo","Ahorrado","Fecha objetivo"],...goals().map(g=>[g.nombre,g.objetivo,r2(goalSaved(g)),fdate(g.fecha)])];
   try {
@@ -1345,11 +1444,11 @@ async function exportYear(){
     X.utils.book_append_sheet(wb,X.utils.aoa_to_sheet(pres),"Préstamos");
     X.utils.book_append_sheet(wb,X.utils.aoa_to_sheet(deu),"Deudas");
     X.utils.book_append_sheet(wb,X.utils.aoa_to_sheet(met),"Metas");
-    X.writeFile(wb,"mis-finanzas-"+y+".xlsx");
+    X.writeFile(wb,"sol-"+y+".xlsx");
   } catch(e){
     const rows = [["Resumen "+y],...resumen,[],...MESES.flatMap((n,m)=>monthMovs(y,m).length?[[cap(n)],...movs(m),[]]:[]),["Cuentas"],...ctas,[],["Préstamos"],...pres,[],["Deudas"],...deu,[],["Metas"],...met];
     const csv = "﻿"+rows.map(r=>r.map(c=>c==null?"":'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\r\n");
-    const a = h("a",{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:"mis-finanzas-"+y+".csv"}); document.body.append(a); a.click(); a.remove();
+    const a = h("a",{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:"sol-"+y+".csv"}); document.body.append(a); a.click(); a.remove();
   }
 }
 
@@ -1378,4 +1477,4 @@ function startApp(store){
   try { await firebaseStore(cfg); }
   catch(e){ show("login"); $("login-error").textContent = "No se pudo conectar con Firebase. Revisa tu internet o los datos de config.js."; }
 })();
-if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js?v=4").catch(()=>{}));
+if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js?v=5").catch(()=>{}));
