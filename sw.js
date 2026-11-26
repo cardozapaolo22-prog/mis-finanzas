@@ -1,6 +1,6 @@
 // Permite abrir la app aunque no haya internet (tus datos se sincronizan al volver la conexión).
 // Si cambias algún archivo de la app, sube el número de versión para que los celulares tomen el cambio.
-const VERSION = "mf-v1";
+const VERSION = "mf-v2";
 const SHELL = ["./", "index.html", "styles.css", "app.js", "config.js", "manifest.json", "icons/icon-192.png", "icons/icon-512.png"];
 
 self.addEventListener("install", e => {
