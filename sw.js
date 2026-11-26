@@ -1,7 +1,7 @@
 // Permite abrir la app aunque no haya internet (tus datos se sincronizan al volver la conexión).
 // Si cambias algún archivo de la app, sube el número de versión para que los celulares tomen el cambio.
-const VERSION = "mf-v2";
-const SHELL = ["./", "index.html", "styles.css", "app.js", "config.js", "manifest.json", "icons/icon-192.png", "icons/icon-512.png"];
+const VERSION = "mf-v3";
+const SHELL = ["./", "index.html", "styles.css?v=3", "app.js?v=3", "config.js?v=3", "manifest.json?v=3", "icons/icon-192.png?v=3", "icons/logo-160.png?v=3", "icons/favicon-64.png?v=3"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -24,7 +24,7 @@ self.addEventListener("fetch", e => {
 
   // Primero internet (para tener siempre la última versión), si no hay, la copia guardada
   e.respondWith(
-    fetch(req).then(res => {
+    (url.origin === location.origin ? fetch(req.url, {cache: "no-cache", credentials: "same-origin"}) : fetch(req)).then(res => {
       if (res.ok) { const copy = res.clone(); caches.open(VERSION).then(c => c.put(req, copy)); }
       return res;
     }).catch(() => caches.match(req).then(r => r || (req.mode === "navigate" ? caches.match("index.html") : Response.error())))
