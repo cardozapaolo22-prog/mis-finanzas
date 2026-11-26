@@ -9,8 +9,9 @@ const DEF_OUT = ["Vivienda","Comida","Transporte","Celular / Internet","Servicio
 const DEF_COLOR = "#3a5cf0";
 const DIAS_MES = 30;
 const MODS_DEF = ["alertas","comparacion","cuentas","categorias","proximos","prestamos","metas","movimientos"];
-const MOD_NAMES = {alertas:"Alertas",comparacion:"Planeado, real y proyectado",cuentas:"Cuentas y patrimonio",categorias:"Gastos por categoría",proximos:"Próximos movimientos",prestamos:"Préstamos y deudas",metas:"Metas de ahorro",movimientos:"Ingresos y gastos del mes"};
-const TIPOS_CUENTA = [["efectivo","Efectivo"],["yape","Yape"],["plin","Plin"],["banco","Cuenta bancaria"],["billetera","Billetera digital"],["otra","Otra"]];
+const MOD_NAMES = {alertas:"Alertas",comparacion:"Planeado, real y proyectado",cuentas:"Tarjetas de cuentas y patrimonio",categorias:"Gastos por categoría",proximos:"Próximos movimientos",prestamos:"Préstamos y deudas",metas:"Metas de ahorro",movimientos:"Ingresos y gastos del mes"};
+const TIPOS_CUENTA = [["efectivo","Efectivo"],["yape","Yape"],["plin","Plin"],["banco","Cuenta bancaria"],["billetera","Billetera digital"],["credito","Tarjeta de crédito"],["otra","Otra"]];
+const isCredit = a => !!a && a.tipo==="credito";
 const FREQS = [["","No se repite"],["diaria","Cada día"],["semanal","Cada semana"],["quincenal","Cada 15 días"],["mensual","Cada mes"],["anual","Cada año"],["cada","Cada cierto número de días"]];
 
 const fmtPEN = new Intl.NumberFormat("es-PE",{style:"currency",currency:"PEN",minimumFractionDigits:2,maximumFractionDigits:2});
@@ -162,9 +163,11 @@ function balances(atISO){
 }
 function available(atISO){
   const b = balances(atISO), t = {PEN:0,USD:0,hasUSD:false};
-  for (const a of accounts()){ if (a.archivada) continue; const c = a.moneda==="USD"?"USD":"PEN"; t[c]+=b[a.id]||0; if (c==="USD") t.hasUSD=true; }
+  for (const a of accounts()){ if (a.archivada || isCredit(a)) continue; const c = a.moneda==="USD"?"USD":"PEN"; t[c]+=b[a.id]||0; if (c==="USD") t.hasUSD=true; }
   return t;
 }
+function cardInfo(a,bal){ const b = bal ?? balances()[a.id] ?? 0; const used = Math.max(0,-b); const linea = a.linea||0; return {used, linea, free:Math.max(0,linea-used), share: linea>0?Math.min(1,used/linea):0}; }
+function cardsDebt(atISO){ const b = balances(atISO); return accounts().filter(a=>isCredit(a) && a.moneda!=="USD").reduce((s,a)=>s+Math.max(0,-(b[a.id]||0)),0); }
 function goalSaved(g,atISO){
   const ap = g.aportes||[], sumAp = ap.reduce((s,a)=>s+(a.monto||0),0), legacy = (g.acumulado||0)-sumAp;
   return legacy + ap.filter(a=>!atISO||a.fecha<=atISO).reduce((s,a)=>s+(a.monto||0),0);
@@ -178,8 +181,9 @@ function worth(atISO){
   const cash = available(atISO).PEN;
   const metas = goals().reduce((s,g)=>s+goalSaved(g,atISO),0);
   const capital = loans().filter(p=>p.fecha && p.fecha<=at && !(p.estado==="pagado" && p.fechaPago && p.fechaPago<=at)).reduce((s,p)=>s+(p.monto||0),0);
-  const deuda = debts().reduce((s,d)=>s+Math.max(0,(d.total||0)-debtPaid(d,atISO)),0);
-  return {cash,metas,capital,deuda,neto:cash+metas+capital-deuda};
+  const tarjetas = cardsDebt(atISO);
+  const deuda = debts().reduce((s,d)=>s+Math.max(0,(d.total||0)-debtPaid(d,atISO)),0) + tarjetas;
+  return {cash,metas,capital,deuda,tarjetas,neto:cash+metas+capital-deuda};
 }
 
 /* ---------- eventos del calendario ---------- */
@@ -204,7 +208,42 @@ function eventsBetween(a,b){
     }
     for (const x of d.abonos||[]) if (x.fecha>=a && x.fecha<=b && !d.diaPago) out.push({date:x.fecha,kind:"debt",title:"Abono · "+(d.nombre||""),amt:x.monto,done:true,debt:d});
   }
+  const bal = balances();
+  for (const c of accounts().filter(a=>isCredit(a) && !a.archivada && a.diaPago)){
+    let s = parseISO(a); s = new Date(s.getFullYear(),s.getMonth(),1);
+    for (let g=0; g<14; g++){
+      const y=s.getFullYear(), m=s.getMonth(), dd = iso(new Date(y,m,Math.min(c.diaPago,lastDay(y,m))));
+      if (dd>b) break;
+      if (dd>=a){
+        const paidMonth = allStored().some(x=>x.tipo==="tr" && x.cuentaDestino===c.id && isDone(x) && x._date>=monthStart(y,m) && x._date<=monthEnd(y,m));
+        const used = cardInfo(c,bal[c.id]).used, cleared = used<0.005;
+        if (!cleared || paidMonth) out.push({date:dd,kind:"card",title:(cleared?"Pagaste ":"Pagar ")+c.nombre,amt:cleared?null:used,cur:c.moneda==="USD"?"USD":"PEN",done:cleared,card:c});
+      }
+      s = new Date(y,m+1,1);
+    }
+  }
   return out.sort((x,y)=>x.date.localeCompare(y.date));
+}
+
+/* ---------- lo que te quedará a fin de mes ---------- */
+function endOfMonth(y,m,t){
+  const accs = accounts().filter(a=>!a.archivada && !isCredit(a) && a.moneda!=="USD");
+  const isNow = y===now.getFullYear() && m===now.getMonth();
+  if (!accs.length || !isNow) return {mode:"mes", value:t.balJ, parts:[["Ingresos del mes (contando pendientes)",t.inJ],["Gastos del mes (contando programados)",-t.outJ]]};
+  const L = monthMovs(y,m), a = todayISO(), b = monthEnd(y,m);
+  const cash = available().PEN;
+  const pin = L.filter(x=>x.tipo==="in" && !isDone(x) && curOf(x)==="PEN").reduce((s,x)=>s+(x.plan||0),0);
+  const pout = L.filter(x=>x.tipo==="out" && !isDone(x) && curOf(x)==="PEN" && !isCredit(acc(x.cuenta))).reduce((s,x)=>s+(x.plan||0),0);
+  const ev = eventsBetween(monthStart(y,m),b);
+  const cuotas = ev.filter(e=>e.kind==="debt" && !e.done && e.amt).reduce((s,e)=>s+e.amt,0);
+  const cards = ev.filter(e=>e.kind==="card" && !e.done && e.cur!=="USD").reduce((s,e)=>s+(e.amt||0),0);
+  const cobros = ev.filter(e=>e.kind==="loan" && !e.done).reduce((s,e)=>s+(e.amt||0),0);
+  const parts = [["Dinero que tienes hoy",cash],["Ingresos que faltan recibir",pin]];
+  if (cobros) parts.push(["Cobros de préstamos que vencen este mes",cobros]);
+  parts.push(["Gastos programados que faltan pagar",-pout]);
+  if (cuotas) parts.push(["Cuotas de deudas del mes",-cuotas]);
+  if (cards) parts.push(["Pago de tarjetas de crédito",-cards]);
+  return {mode:"cuentas", value:parts.reduce((s,p)=>s+p[1],0), parts};
 }
 
 /* ======================= tema y color ======================= */
@@ -349,6 +388,7 @@ const IC = {
   banco:'<path d="M3 10l9-6 9 6M5 10v8M19 10v8M9 10v8M15 10v8M3 20h18"/>',
   billetera:'<path d="M3 7a2 2 0 0 1 2-2h12v4"/><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M16 13h2"/>',
   otra:'<circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/>',
+  credito:'<rect x="2" y="5" width="20" height="14" rx="3"/><path d="M2 10h20M6 15h5"/>',
   rep:'<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>'
 };
 function accIcon(a){
@@ -474,14 +514,28 @@ function statusMsg(t,y,m){
   return ["✓","Vas según lo planificado"];
 }
 
+function eomBox(eom){
+  const open = isOpen("eom",false);
+  const box = h("button",{type:"button",class:"eom"+(open?" open":""),"aria-expanded":String(open)});
+  const det = h("div",{class:"eom-d"}, eom.parts.map(([l,v])=>h("div",null,h("span",{text:l}),h("b",{text:(v<0?"− ":"+ ")+money(Math.abs(v))}))),
+    h("div",{class:"eom-tot"},h("span",{text:"Te quedará"}),h("b",{text:money(eom.value)})),
+    h("p",{text: eom.mode==="cuentas" ? "Suponiendo que se cumple todo lo que ya colocaste en el mes." : "Registra tus cuentas para calcularlo con el dinero que tienes hoy."}));
+  det.hidden = !open;
+  box.append(h("span",{class:"eom-l"},"Te quedará a fin de mes",h("i",{text:open?"▲":"▼"})), h("span",{class:"eom-v"+(eom.value<0?" neg-h":""),text:money(eom.value)}), det);
+  box.onclick = () => { const o = det.hidden; det.hidden = !o; box.classList.toggle("open",o); box.setAttribute("aria-expanded",String(o)); box.querySelector("i").textContent = o?"▲":"▼"; setOpen("eom",o); };
+  return box;
+}
+
 function viewInicio(){
   const L = monthMovs(S.y,S.m), t = totals(L), out = [];
   const [si,sm] = statusMsg(t,S.y,S.m);
+  const past = new Date(S.y,S.m+1,1) <= new Date(now.getFullYear(),now.getMonth(),1);
+  const eom = past ? null : endOfMonth(S.y,S.m,t);
   out.push(heroBox("Sobrante real de "+MESES[S.m], t.bal,
     [["Ingresos",money(t.inR)],["Gastos",money(t.outR)],["Ahorro potencial",t.inJ>0?pct(t.rateJ):"—"]],
-    h("div",{style:"display:grid;gap:6px"},
+    h("div",{style:"display:grid;gap:8px"},
       h("span",{class:"hstatus"},h("span",{text:si}),sm),
-      h("span",{class:"hproj"},"Proyección al cierre: ",h("b",{text:money(t.balJ)})),
+      eom ? eomBox(eom) : h("span",{class:"hproj"},"Cerraste el mes con ",h("b",{text:money(t.bal)})),
       (t.usdIn||t.usdOut) ? h("span",{class:"usd",text:"En dólares: +"+money(t.usdIn,"USD")+" / −"+money(t.usdOut,"USD")}) : null)));
 
   const order = (prefs().modulos||{}).order || MODS_DEF;
@@ -512,19 +566,23 @@ const MODULES = {
 
   cuentas: () => {
     const av = available(), w = worth(), accs = accounts().filter(a=>!a.archivada), bal = balances();
-    return mod("cuentas",{title:"Cuentas y patrimonio",icon:"cuentas",defOpen:false,
-      summary: accs.length ? [h("strong",{text:money(av.PEN)})," disponible", av.hasUSD?" · "+money(av.USD,"USD"):"", " · patrimonio ",money(w.neto)] : "Agrega Efectivo, Yape, tu banco…",
+    const strip = h("div",{class:"cards-strip",role:"list","aria-label":"Tus cuentas"},
+      accs.map(a=>accCard(a,bal[a.id])),
+      h("button",{class:"acard add",type:"button",role:"listitem",onclick:()=>openAccount({})},h("span",{class:"plus",text:"+"}),h("span",{text:accs.length?"Agregar cuenta":"Agrega tu primera cuenta"}),h("small",{text:"Efectivo, Yape, banco, tarjeta…"})));
+    const head = h("div",{class:"sechead",style:"margin-bottom:8px"},h("h2",null,"Tus cuentas ",accs.length?h("span",{class:"tot"},money(av.PEN)+" disponible"+(av.hasUSD?" · "+money(av.USD,"USD"):"")):null),
+      accs.filter(a=>!isCredit(a)).length>1 ? h("button",{class:"btn ghost sm",onclick:()=>openTransfer({})},"⇄ Transferir") : null);
+    const pat = mod("patrimonio",{title:"Patrimonio neto",icon:"cuentas",defOpen:false,
+      summary:[h("strong",null,signed(w.neto))," · tienes ",money(w.cash)," · te deben ",money(w.capital)," · debes ",money(w.deuda)],
       body:()=>[
-        accs.length ? h("div",{class:"lrows"},accs.map(a=>lrow({id:"acc-"+a.id,ic:accIcon(a),c:a.nombre,m:(TIPOS_CUENTA.find(x=>x[0]===a.tipo)||["","Otra"])[1]+(a.moneda==="USD"?" · US$":""),a:money(bal[a.id],a.moneda),p:"",body:()=>accDetail(a)})))
-          : h("p",{class:"note",style:"margin:0",text:"Registra dónde tienes tu dinero para saber cuánto tienes disponible. No se piden datos bancarios: solo un nombre y el saldo actual."}),
         h("div",{class:"mini-list"},
           h("div",null,h("span",{text:"Dinero disponible"}),h("b",{text:money(w.cash)})),
           av.hasUSD ? h("div",null,h("span",{text:"Disponible en dólares"}),h("b",{text:money(av.USD,"USD")})) : null,
           w.metas ? h("div",null,h("span",{text:"Apartado en metas"}),h("b",{text:money(w.metas)})) : null,
           h("div",null,h("span",{text:"Te deben (capital prestado)"}),h("b",{text:money(w.capital)})),
-          h("div",null,h("span",{text:"Debes"}),h("b",{class:"neg",text:"−"+money(w.deuda)})),
+          h("div",null,h("span",{text:"Debes (deudas"+(w.tarjetas?" y tarjetas":"")+")"}),h("b",{class:"neg",text:"−"+money(w.deuda)})),
           h("div",{style:"border-top:1px solid var(--glass-line);padding-top:6px"},h("span",{text:"Patrimonio neto",style:"color:var(--ink);font-weight:600"}),h("b",null,signed(w.neto)))),
-        h("div",{class:"mod-act"},h("button",{class:"btn sm",onclick:()=>openAccount({})},"+ Cuenta"), accs.length>1?h("button",{class:"btn ghost sm",onclick:()=>openTransfer({})},"Transferir"):null)]});
+        h("p",{class:"note",style:"margin:0",text:"Patrimonio = lo que tienes + metas + lo que te deben − lo que debes (deudas y tarjetas). Los intereses por cobrar no se suman."})]});
+    return h("section",{class:"full",style:"display:grid;gap:10px"},head,strip,pat);
   },
 
   categorias: ({L,t}) => {
@@ -593,12 +651,11 @@ const MODULES = {
 
 function computeAlerts(t){
   const out = [], a = todayISO();
-  const soon = eventsBetween(a,addDays(a,3)).filter(e=>!e.done && (e.kind==="out"||e.kind==="debt"));
+  const soon = eventsBetween(a,addDays(a,3)).filter(e=>!e.done && (e.kind==="out"||e.kind==="debt"||e.kind==="card"));
   const late = loans().filter(loanLate);
   if (late.length) out.push(["bad", late.length===1 ? "El préstamo de "+(late[0].nombre||"")+" está vencido." : "Tienes "+late.length+" préstamos vencidos por cobrar."]);
-  const remaining = eventsBetween(a,monthEnd(now.getFullYear(),now.getMonth())).filter(e=>!e.done && (e.kind==="out"||e.kind==="debt") && e.cur!=="USD").reduce((s,e)=>s+(e.amt||0),0);
-  const av = available();
-  if (accounts().some(x=>!x.archivada) && remaining>0 && av.PEN<remaining) out.push(["bad","Tu saldo disponible ("+money(av.PEN)+") podría no cubrir los pagos que faltan este mes ("+money(remaining)+")."]);
+  const eom = endOfMonth(now.getFullYear(),now.getMonth(),t);
+  if (eom.mode==="cuentas" && eom.value<0) out.push(["bad","Con lo que tienes programado, terminarías el mes en "+money(eom.value)+". Tu saldo no cubre todos los pagos."]);
   if (soon.length) out.push(["warn", soon.length===1 ? "Pago próximo: "+soon[0].title+" el "+fshort(soon[0].date)+(soon[0].amt?" ("+money(soon[0].amt,soon[0].cur)+")":"")+"." : "Tienes "+soon.length+" pagos en los próximos 3 días."]);
   const over = Object.keys(t.catP).filter(c=>t.catP[c]>0 && t.catR[c]>t.catP[c]).sort((x,y)=>(t.catR[y]-t.catP[y])-(t.catR[x]-t.catP[x]));
   if (over.length) out.push(["warn","Superaste el presupuesto de "+over[0]+": "+money(t.catR[over[0]])+" de "+money(t.catP[over[0]])+"."]);
@@ -670,19 +727,20 @@ function movList(tipo,L,t){
 }
 
 /* ---------- eventos ---------- */
-const evColor = k => ({in:"ev-in",out:"ev-out",loan:"ev-loan",debt:"ev-debt",tr:"ev-loan"})[k];
+const evColor = k => ({in:"ev-in",out:"ev-out",loan:"ev-loan",debt:"ev-debt",card:"ev-debt",tr:"ev-loan"})[k];
 function evRow(e){
   const act = [];
   if (!e.done){
     if (e.item) act.push(h("button",{class:"btn sm",onclick:()=>confirmMov(e.item)},e.kind==="in"?"Ya lo recibí":"Ya lo pagué"));
     if (e.loan) act.push(h("button",{class:"btn sm",onclick:()=>openPaid(e.loan)},"Cobrar"));
     if (e.debt) act.push(h("button",{class:"btn sm",onclick:()=>openAbono(e.debt)},"Abonar"));
+    if (e.card) act.push(h("button",{class:"btn sm",onclick:()=>openTransfer({cuentaDestino:e.card.id,real:e.amt?r2(e.amt):null})},"Pagar"));
   }
   if (e.item) act.push(h("button",{class:"btn ghost sm",onclick:()=>e.kind==="tr"?openTransfer(e.item):openMov(e.item)},"Ver"));
   return h("div",{class:"evrow"},
     h("span",{class:"k "+evColor(e.kind)}),
     h("span",{class:"c",text:e.title}),
-    h("span",{class:"a",text:e.amt?(e.kind==="out"||e.kind==="debt"?"−":"+")+money(e.amt,e.cur):""}),
+    h("span",{class:"a",text:e.amt?(e.kind==="out"||e.kind==="debt"||e.kind==="card"?"−":"+")+money(e.amt,e.cur):""}),
     h("span",{class:"m"},fshort(e.date)+" · ", e.done ? h("span",{class:"done-chip",text:"Realizado"}) : h("span",{class:"prog-chip",text:"Pendiente"})),
     act.length ? h("div",{class:"r"},act) : null);
 }
@@ -769,7 +827,7 @@ function viewCalendario(){
   return [
     h("div",{class:"glass card"},grid,
       h("div",{class:"legend",style:"flex-wrap:wrap"},
-        h("span",null,h("i",{class:"ev-in"}),"Ingresos"),h("span",null,h("i",{class:"ev-out"}),"Gastos"),h("span",null,h("i",{class:"ev-loan"}),"Préstamos"),h("span",null,h("i",{class:"ev-debt"}),"Deudas"))),
+        h("span",null,h("i",{class:"ev-in"}),"Ingresos"),h("span",null,h("i",{class:"ev-out"}),"Gastos"),h("span",null,h("i",{class:"ev-loan"}),"Préstamos"),h("span",null,h("i",{class:"ev-debt"}),"Deudas y tarjetas"))),
     h("section",null,h("div",{class:"sechead"},h("h2",{text:cap(fshort(S.selDay))+" · "+["domingo","lunes","martes","miércoles","jueves","viernes","sábado"][parseISO(S.selDay).getDay()]}),
       h("button",{class:"btn ghost sm",onclick:()=>openMov({tipo:"out",fecha:S.selDay})},"+ Agregar este día")),
       h("div",{class:"glass card"}, sel.length ? sel.map(evRow) : h("p",{class:"note",text:"No hay movimientos este día."}))),
@@ -849,6 +907,48 @@ function goalRow(g){
       h("div",{class:"inline"},h("button",{class:"btn sm",onclick:()=>openAporte(g,1)},"Aportar"),h("button",{class:"btn ghost sm",onclick:()=>openAporte(g,-1)},"Retirar"),h("button",{class:"btn ghost sm",onclick:()=>openGoal(g)},"Editar"))]});
 }
 
+/* ---------- tarjetas visuales de cuentas ---------- */
+const CARD_GRAD = {efectivo:"linear-gradient(135deg,#11998e,#38ef7d)",yape:"linear-gradient(135deg,#5f2c82,#a84fd8)",plin:"linear-gradient(135deg,#0083b0,#00c6e6)",banco:"linear-gradient(135deg,hsl(var(--h) 80% 50%),hsl(calc(var(--h) + 40) 75% 45%))",billetera:"linear-gradient(135deg,#f7971e,#ffb347)",credito:"linear-gradient(135deg,#1c1f3a,#3b3f73 60%,#8a6f2f)",otra:"linear-gradient(135deg,#4b5563,#9ca3af)"};
+function accCard(a,bal){
+  const cur = a.moneda==="USD"?"USD":"PEN", tipo = (TIPOS_CUENTA.find(x=>x[0]===a.tipo)||["","Cuenta"])[1];
+  const card = h("button",{class:"acard",type:"button",role:"listitem",style:"background:"+(CARD_GRAD[a.tipo]||CARD_GRAD.otra),onclick:()=>openAccDetail(a),"aria-label":a.nombre+", "+tipo});
+  const top = h("span",{class:"ac-top"},h("span",{class:"ac-type",text:tipo+(cur==="USD"?" · US$":"")}), accIcon(a));
+  if (isCredit(a)){
+    const ci = cardInfo(a,bal);
+    card.append(top, h("span",{class:"ac-name",text:a.nombre}),
+      h("span",{class:"ac-lab",text:"Consumido"}), h("span",{class:"ac-bal",text:money(ci.used,cur)}),
+      h("span",{class:"ac-bar"},h("i",{style:"width:"+ci.share*100+"%"})),
+      h("span",{class:"ac-foot"},h("span",{text:"Disponible "+money(ci.free,cur)}),h("span",{text:a.ultimos4?"•••• "+a.ultimos4:""})));
+  } else {
+    card.append(top, h("span",{class:"ac-name",text:a.nombre}), h("span",{class:"ac-lab",text:"Saldo"}), h("span",{class:"ac-bal",text:money(bal,cur)}),
+      h("span",{class:"ac-foot"},h("span",{text:"Toca para ver movimientos"}),h("span",{text:a.ultimos4?"•••• "+a.ultimos4:""})));
+  }
+  return card;
+}
+function openAccDetail(a){
+  modal(close=>{
+    const bal = balances()[a.id]||0, cur = a.moneda==="USD"?"USD":"PEN";
+    const ev = ledger().filter(e=>e.cuenta===a.id).sort((x,y)=>y.date.localeCompare(x.date)).slice(0,8);
+    const ci = isCredit(a) ? cardInfo(a,bal) : null;
+    return h("div",{style:"display:grid;gap:12px"},
+      h("div",{class:"acard big",style:"background:"+(CARD_GRAD[a.tipo]||CARD_GRAD.otra)},
+        h("span",{class:"ac-top"},h("span",{class:"ac-type",text:(TIPOS_CUENTA.find(x=>x[0]===a.tipo)||["","Cuenta"])[1]}),accIcon(a)),
+        h("span",{class:"ac-name",text:a.nombre}),
+        h("span",{class:"ac-lab",text:ci?"Consumido":"Saldo"}), h("span",{class:"ac-bal",text:money(ci?ci.used:bal,cur)}),
+        ci ? h("span",{class:"ac-bar"},h("i",{style:"width:"+ci.share*100+"%"})) : null,
+        h("span",{class:"ac-foot"},h("span",{text:ci?"Disponible "+money(ci.free,cur)+" de "+money(ci.linea,cur):""}),h("span",{text:a.ultimos4?"•••• "+a.ultimos4:""}))),
+      ci && a.diaPago ? h("p",{class:"note",style:"margin:0",text:"Pagas esta tarjeta el día "+a.diaPago+" de cada mes."}) : null,
+      h("div",{class:"subhead",style:"margin:0",text:"Últimos movimientos"}),
+      ev.length ? h("div",{class:"mini-list"},ev.map(e=>h("div",null,h("span",{text:fshort(e.date)+" · "+(e.label||(e.it.tipo==="tr"?(e.amt>0&&ci?"Pago de tarjeta":"Transferencia"):(e.it.concepto||e.it.cat)))}),h("b",{class:e.amt<0?"":"pos",text:(e.amt<0?"−":"+")+money(Math.abs(e.amt),cur)})))) : h("p",{class:"note",style:"margin:0",text:"Sin movimientos todavía."}),
+      h("div",{class:"actions"},
+        h("div",{class:"inline"},
+          ci && ci.used>0 ? h("button",{class:"btn sm",onclick:()=>{ close(); openTransfer({cuentaDestino:a.id,real:r2(ci.used)}); }},"Pagar tarjeta") : null,
+          h("button",{class:"btn ghost sm",onclick:()=>{ close(); openAccount(a); }},"Editar"),
+          h("button",{class:"btn ghost sm",onclick:()=>{ close(); withUndo(["cuentas"],()=>setList("cuentas",accounts().map(x=>x.id===a.id?{...x,archivada:true}:x)),"Cuenta archivada."); }},"Archivar")),
+        h("div",{class:"r"},h("button",{class:"btn ghost",type:"button",onclick:close},"Cerrar"))));
+  });
+}
+
 /* ---------- detalle de cuenta ---------- */
 function accDetail(a){
   const ev = ledger().filter(e=>e.cuenta===a.id).sort((x,y)=>y.date.localeCompare(x.date)).slice(0,5);
@@ -887,7 +987,7 @@ function viewAjustes(){
   const archived = accounts().filter(a=>a.archivada);
   out.push(h("section",null,h("div",{class:"sechead"},h("h2",{text:"Cuentas y billeteras"}),h("button",{class:"btn sm",onclick:()=>openAccount({})},"+ Cuenta")),
     h("div",{class:"glass list"},
-      accounts().filter(a=>!a.archivada).map(a=>h("div",{class:"catrow"},h("span",{text:a.nombre+(a.moneda==="USD"?" (US$)":"")}),h("button",{class:"btn ghost sm",onclick:()=>openAccount(a)},"Editar"))),
+      accounts().filter(a=>!a.archivada).map(a=>h("div",{class:"catrow"},h("span",null,a.nombre+(a.moneda==="USD"?" (US$)":""),isCredit(a)?h("span",{class:"tag",text:"Crédito"}):null),h("button",{class:"btn ghost sm",onclick:()=>openAccount(a)},"Editar"))),
       archived.map(a=>h("div",{class:"catrow"},h("span",null,a.nombre,h("span",{class:"tag",text:"Archivada"})),h("button",{class:"btn ghost sm",onclick:()=>setList("cuentas",accounts().map(x=>x.id===a.id?{...x,archivada:false}:x))},"Restaurar"))),
       !accounts().length ? h("div",{class:"empty",text:"Aún no tienes cuentas."}) : null)));
 
@@ -966,7 +1066,7 @@ function openQuick(){
       h("div",{class:"quick"},
         h("button",{type:"button",onclick:()=>{close();openMov({tipo:"in"});}},h("span",{text:"↓"}),"Ingreso"),
         h("button",{type:"button",onclick:()=>{close();openMov({tipo:"out"});}},h("span",{text:"↑"}),"Gasto"),
-        h("button",{type:"button",onclick:()=>{ close(); if (accounts().filter(a=>!a.archivada).length<2){ toast("Necesitas al menos 2 cuentas para transferir."); openAccount({}); } else openTransfer({}); }},h("span",{text:"⇄"}),"Transferencia")),
+        h("button",{type:"button",onclick:()=>{ close(); if (accounts().filter(a=>!a.archivada).length<2 || !accounts().some(a=>!a.archivada&&!isCredit(a))){ toast("Necesitas al menos 2 cuentas para transferir."); openAccount({}); } else openTransfer({}); }},h("span",{text:"⇄"}),"Transferencia")),
       fr.length ? h("div",{style:"display:grid;gap:8px"},h("div",{class:"subhead",style:"margin:0",text:"Frecuentes · un toque"}),
         h("div",{class:"freq"},fr.map(it=>h("button",{class:"pill",type:"button",onclick:()=>{ close(); openMov({tipo:it.tipo,concepto:it.concepto,cat:it.cat,cuenta:it.cuenta,_amount:it.real??it.plan}); }},(it.tipo==="in"?"+ ":"− ")+it.concepto+" · "+money(it.real??it.plan,curOf(it)))))) : null,
       h("div",{class:"actions"},h("div",{class:"r"},h("button",{class:"btn ghost",type:"button",onclick:close},"Cerrar"))));
@@ -1056,18 +1156,22 @@ function openTransfer(it){
   const isNew = !it.id;
   modal(close=>{
     const imp = amountInput("t-imp", it.real);
-    const from = accSelect("t-from", it.cuenta||lastAcc(), false), to = accSelect("t-to", it.cuentaDestino||"", false);
+    const bals = balances(), richest = (accounts().filter(a=>!a.archivada&&!isCredit(a)).sort((x,y)=>(bals[y.id]||0)-(bals[x.id]||0))[0]||{}).id||"";
+    const fromDef = it.cuenta || (isCredit(acc(it.cuentaDestino)) || isCredit(acc(lastAcc())) ? richest : lastAcc());
+    const from = accSelect("t-from", fromDef, false), to = accSelect("t-to", it.cuentaDestino||"", false);
     if (!it.cuentaDestino){ const o = [...to.options].find(o=>o.value!==from.value); if (o) to.value = o.value; }
+    const payCard = isCredit(acc(it.cuentaDestino));
     const fecha = h("input",{id:"t-fecha",type:"date",value:it.fecha||defaultDate()});
     const nota = h("input",{id:"t-nota",value:it.nota||"",placeholder:"Opcional"});
     const del = isNew ? null : delBtn("Eliminar",()=>{ close(); removeMov(it); });
     return h("form",{style:"display:grid;gap:12px",onsubmit:e=>{
       e.preventDefault(); const v = num(imp.value); if (v==null||v<=0){ toast("Escribe el importe."); return; }
       if (!from.value || !to.value || from.value===to.value){ toast("Elige dos cuentas distintas."); return; }
+      if (isCredit(acc(from.value))){ toast("No se puede transferir desde una tarjeta de crédito."); return; }
       saveMov({id:it.id||uid(),tipo:"tr",concepto:"Transferencia",cat:null,cuenta:from.value,cuentaDestino:to.value,fecha:fecha.value||todayISO(),real:v,plan:null,nota:nota.value.trim()||null}, isNew?null:it._doc);
-      close(); toast("Transferencia registrada ✓");
-    }}, h("h3",{text:"Transferir entre cuentas"}), imp, h("div",{class:"two"},field("Desde",from),field("Hacia",to)), field("Fecha",fecha), field("Nota",nota),
-      h("p",{class:"note",style:"margin:0",text:"No cuenta como ingreso ni como gasto: solo mueve tu dinero."}), actions(close,del));
+      close(); toast(isCredit(acc(to.value))?"Pago de tarjeta registrado ✓":"Transferencia registrada ✓");
+    }}, h("h3",{text:payCard?"Pagar "+acc(it.cuentaDestino).nombre:"Transferir entre cuentas"}), imp, h("div",{class:"two"},field("Desde",from),field("Hacia",to)), field("Fecha",fecha), field("Nota",nota),
+      h("p",{class:"note",style:"margin:0",text:payCard?"Pagar la tarjeta baja lo consumido. No cuenta como gasto: los gastos ya se registraron cuando usaste la tarjeta.":"No cuenta como ingreso ni como gasto: solo mueve tu dinero. Para pagar una tarjeta, elígela en «Hacia»."}), actions(close,del));
   });
 }
 function openAccount(a){
@@ -1076,15 +1180,30 @@ function openAccount(a){
     const nombre = h("input",{id:"a-nombre",value:a.nombre||"",placeholder:"Ej. Yape, BCP Ahorros, Efectivo"});
     const tipo = h("select",{id:"a-tipo"},TIPOS_CUENTA.map(([v,l])=>h("option",{value:v,selected:v===(a.tipo||"efectivo")},l)));
     const moneda = h("select",{id:"a-mon"},h("option",{value:"PEN",selected:a.moneda!=="USD"},"Soles (S/)"),h("option",{value:"USD",selected:a.moneda==="USD"},"Dólares (US$)"));
-    const saldo = h("input",{id:"a-saldo",type:"number",inputmode:"decimal",step:"0.01",value:a.saldoInicial??"",placeholder:"0.00"});
+    const saldo = h("input",{id:"a-saldo",type:"number",inputmode:"decimal",step:"0.01",value:a.tipo==="credito"?"":(a.saldoInicial??""),placeholder:"0.00"});
+    const linea = h("input",{id:"a-linea",type:"number",inputmode:"decimal",step:"0.01",min:"0",value:a.linea??"",placeholder:"Ej. 5000"});
+    const usado = h("input",{id:"a-usado",type:"number",inputmode:"decimal",step:"0.01",min:"0",value:a.tipo==="credito"?Math.max(0,-(a.saldoInicial||0)):"",placeholder:"0.00"});
+    const dia = h("input",{id:"a-dia",type:"number",min:"1",max:"31",step:"1",value:a.diaPago??"",placeholder:"Ej. 5"});
+    const u4 = h("input",{id:"a-u4",inputmode:"numeric",value:a.ultimos4||"",placeholder:"Opcional",autocomplete:"off"});
+    u4.addEventListener("input",()=>{ u4.value = u4.value.replace(/\D/g,"").slice(0,4); });
+    const saldoF = field(isNew?"¿Cuánto tienes ahora?":"Saldo inicial",saldo);
+    const creditF = h("div",{style:"display:grid;gap:12px"},
+      h("div",{class:"two"},field("Línea de crédito",linea),field(isNew?"¿Cuánto llevas consumido?":"Consumo inicial",usado)),
+      h("div",{class:"two"},field("Día de pago",dia),field("Últimos 4 dígitos",u4)));
+    const sync = () => { const c = tipo.value==="credito"; creditF.hidden = !c; saldoF.hidden = c; };
+    tipo.addEventListener("change",sync); sync();
     return h("form",{style:"display:grid;gap:12px",onsubmit:e=>{
       e.preventDefault(); const n = nombre.value.trim() || (TIPOS_CUENTA.find(x=>x[0]===tipo.value)||["","Cuenta"])[1];
-      const rec = {...a,id:a.id||uid(),nombre:n,tipo:tipo.value,moneda:moneda.value,saldoInicial:num(saldo.value)||0,archivada:!!a.archivada};
+      const cr = tipo.value==="credito";
+      if (cr && !(num(linea.value)>0)){ toast("Escribe la línea de crédito de la tarjeta."); return; }
+      if (u4.value && u4.value.length!==4){ toast("Los últimos dígitos deben ser 4 números, o déjalo vacío."); return; }
+      const rec = {...a,id:a.id||uid(),nombre:n,tipo:tipo.value,moneda:moneda.value,saldoInicial:cr?-(num(usado.value)||0):(num(saldo.value)||0),archivada:!!a.archivada,
+        linea:cr?num(linea.value):null,diaPago:cr?(Math.min(31,Math.max(0,parseInt(dia.value)||0))||null):null,ultimos4:(u4.value.length===4?u4.value:null)};
       setList("cuentas", isNew?[...accounts(),rec]:accounts().map(x=>x.id===rec.id?rec:x)); if (isNew && !lastAcc()) setLastAcc(rec.id);
       close(); toast(isNew?"Cuenta creada ✓":"Guardado ✓");
     }}, h("h3",{text:isNew?"Nueva cuenta":"Editar cuenta"}), field("Nombre",nombre), h("div",{class:"two"},field("Tipo",tipo),field("Moneda",moneda)),
-      field(isNew?"¿Cuánto tienes ahora?":"Saldo inicial",saldo),
-      h("p",{class:"note",style:"margin:0",text:"Solo un nombre y el saldo. Nunca te pediremos números de cuenta ni claves."}), actions(close));
+      saldoF, creditF,
+      h("p",{class:"note",style:"margin:0",text:"Solo un nombre y el saldo. Nunca te pediremos números completos de cuenta o tarjeta, ni claves."}), actions(close));
   });
 }
 
@@ -1259,4 +1378,4 @@ function startApp(store){
   try { await firebaseStore(cfg); }
   catch(e){ show("login"); $("login-error").textContent = "No se pudo conectar con Firebase. Revisa tu internet o los datos de config.js."; }
 })();
-if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js?v=3").catch(()=>{}));
+if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js?v=4").catch(()=>{}));

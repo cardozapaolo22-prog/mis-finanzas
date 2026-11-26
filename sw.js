@@ -1,7 +1,7 @@
 // Permite abrir la app aunque no haya internet (tus datos se sincronizan al volver la conexión).
 // Si cambias algún archivo de la app, sube el número de versión para que los celulares tomen el cambio.
-const VERSION = "mf-v3";
-const SHELL = ["./", "index.html", "styles.css?v=3", "app.js?v=3", "config.js?v=3", "manifest.json?v=3", "icons/icon-192.png?v=3", "icons/logo-160.png?v=3", "icons/favicon-64.png?v=3"];
+const VERSION = "mf-v4";
+const SHELL = ["./", "index.html", "styles.css?v=4", "app.js?v=4", "config.js?v=4", "manifest.json?v=4", "icons/icon-192.png?v=4", "icons/logo-160.png?v=4", "icons/favicon-64.png?v=4"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
