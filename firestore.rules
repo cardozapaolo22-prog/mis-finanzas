@@ -1,0 +1,28 @@
+rules_version = '2';
+
+// Reglas de seguridad de Mis Finanzas
+// - Solo entran los correos que agregues en la colección "permitidos".
+// - Cada persona solo puede leer y escribir SUS propios datos.
+// - Nadie puede modificar la lista de permitidos desde la app (solo tú, desde la consola de Firebase).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function permitido() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && exists(/databases/$(database)/documents/permitidos/$(request.auth.token.email));
+    }
+
+    // Lista de correos con acceso. El ID de cada documento es el correo en minúsculas.
+    match /permitidos/{email} {
+      allow read: if request.auth != null && request.auth.token.email == email;
+      allow write: if false;
+    }
+
+    // Datos de cada persona: meses, deudas y ajustes
+    match /usuarios/{uid}/{documento=**} {
+      allow read, write: if permitido() && request.auth.uid == uid;
+    }
+  }
+}
